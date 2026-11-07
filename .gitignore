@@ -7,3 +7,6 @@ venv/
 *.pt
 TokenEQ/venv/
 TokenEQ/__pycache__/
+venv_models/
+*.csv
+*.pt

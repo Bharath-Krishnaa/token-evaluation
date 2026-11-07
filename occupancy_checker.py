@@ -1,12 +1,6 @@
-"""
-Computes occupancy@k, used by pruning_eval.py.
-
-occupancy@k for one answer position:
-
-overlap between the masked and unmasked model's top-k tokens, divided by k Averaged over all answer positions in a sample -> one number per (sample, lambda, k). 
-1.0 means the masked model's top-k exactly matches the unmasked model's top-k at every position, 0.0 means no overlap.
-
-"""
+# occupancy@k: overlap between the top-k tokens of the masked and normal model,
+# divided by k and averaged over all answer positions.
+# 1.0 = same top-k everywhere, 0.0 = no overlap.
 
 import csv
 import os
@@ -17,8 +11,8 @@ import torch.nn.functional as F
 
 
 def compute_occupancy(model, base_embeddings, final_mask_hard, think_start, think_end,
-                       pred_positions, normal_probs, max_k):
-    # forward pass with the frozen hard mask applied
+                      pred_positions, normal_probs, max_k):
+    # forward pass with the final mask
     with torch.no_grad():
         embeddings = base_embeddings.clone()
         embeddings[:, think_start:think_end, :] = (
@@ -38,8 +32,8 @@ def compute_occupancy(model, base_embeddings, final_mask_hard, think_start, thin
         for pos in range(num_answer_positions):
             normal_set = set(normal_topk[pos].tolist())
             masked_set = set(masked_topk[pos].tolist())
-            intersection = len(normal_set & masked_set)
-            overlaps.append(intersection / k)
+            common = len(normal_set & masked_set)
+            overlaps.append(common / k)
 
         occupancy_per_k[k] = sum(overlaps) / len(overlaps)
 
@@ -50,21 +44,25 @@ class OccupancyChecker:
     def __init__(self, per_sample_csv, max_k):
         self.per_sample_csv = per_sample_csv
         self.max_k = max_k
-        self.completed_pairs = self._load_completed_pairs()
+
+        # rows already in the CSV are not run again
+        self.completed_pairs = self.load_completed_pairs()
         if self.completed_pairs:
-            print(f"found {len(self.completed_pairs)} already-completed (sample_idx, lambda) row(s) "
-                  f"in {per_sample_csv}, skipping those")
+            print(f"occupancy: {len(self.completed_pairs)} rows already in {per_sample_csv}, skipping them")
 
         file_is_new = not os.path.exists(per_sample_csv)
         self.fieldnames = ["sample_idx", "lambda", "num_think_tokens", "kept_tokens", "dropped_tokens",
-                            "skip_reason"] + [f"occupancy@{k}" for k in range(1, max_k + 1)]
-        self._file = open(per_sample_csv, "a", newline="")
-        self._writer = csv.DictWriter(self._file, fieldnames=self.fieldnames)
-        if file_is_new:
-            self._writer.writeheader()
-            self._file.flush()
+                           "skip_reason"]
+        for k in range(1, max_k + 1):
+            self.fieldnames.append(f"occupancy@{k}")
 
-    def _load_completed_pairs(self):
+        self.csv_file = open(per_sample_csv, "a", newline="")
+        self.writer = csv.DictWriter(self.csv_file, fieldnames=self.fieldnames)
+        if file_is_new:
+            self.writer.writeheader()
+            self.csv_file.flush()
+
+    def load_completed_pairs(self):
         completed = set()
         if not os.path.exists(self.per_sample_csv):
             return completed
@@ -80,10 +78,10 @@ class OccupancyChecker:
     def is_done(self, sample_idx, lam):
         return (sample_idx, lam) in self.completed_pairs
 
-    def _write_row(self, row):
-        self._writer.writerow(row)
-        self._file.flush()
-        os.fsync(self._file.fileno())  # write to disk right away
+    def write_row(self, row):
+        self.writer.writerow(row)
+        self.csv_file.flush()
+        os.fsync(self.csv_file.fileno())  # save to disk right away
         self.completed_pairs.add((row["sample_idx"], row["lambda"]))
 
     def record_skip(self, sample_idx, lam, num_think_tokens, skip_reason):
@@ -96,12 +94,13 @@ class OccupancyChecker:
             "kept_tokens": "",
             "dropped_tokens": "",
             "skip_reason": skip_reason,
-            **{f"occupancy@{k}": "" for k in range(1, self.max_k + 1)},
         }
-        self._write_row(row)
+        for k in range(1, self.max_k + 1):
+            row[f"occupancy@{k}"] = ""
+        self.write_row(row)
 
     def record_result(self, model, base_embeddings, final_mask_hard, think_start, think_end,
-                       pred_positions, normal_probs, sample_idx, lam, num_think_tokens, kept):
+                      pred_positions, normal_probs, sample_idx, lam, num_think_tokens, kept):
         if (sample_idx, lam) in self.completed_pairs:
             return None
 
@@ -121,15 +120,14 @@ class OccupancyChecker:
         for k in range(1, self.max_k + 1):
             row[f"occupancy@{k}"] = occupancy_per_k[k]
 
-        self._write_row(row)
+        self.write_row(row)
         return occupancy_per_k
 
     def close(self):
-        self._file.close()
+        self.csv_file.close()
 
     def write_summary(self, summary_csv_path):
-        # rebuilds summary_csv from scratch using whatever is currently in
-        # per_sample_csv, so it always reflects all rows collected so far
+        # summary is made from all rows in the per sample CSV
         results = {}
         skipped_count = {}
 
@@ -140,8 +138,10 @@ class OccupancyChecker:
                     lam = float(row["lambda"])
                 except (KeyError, ValueError, TypeError):
                     continue
-                results.setdefault(lam, {k: [] for k in range(1, self.max_k + 1)})
-                skipped_count.setdefault(lam, 0)
+
+                if lam not in results:
+                    results[lam] = {k: [] for k in range(1, self.max_k + 1)}
+                    skipped_count[lam] = 0
 
                 if row.get("skip_reason"):
                     skipped_count[lam] += 1
@@ -154,9 +154,11 @@ class OccupancyChecker:
 
         summary_rows = []
         for lam in sorted(results.keys()):
-            num_used = len(results[lam][1])
-            num_skipped = skipped_count[lam]
-            row = {"lambda": lam, "num_samples_used": num_used, "num_samples_skipped": num_skipped}
+            row = {
+                "lambda": lam,
+                "num_samples_used": len(results[lam][1]),
+                "num_samples_skipped": skipped_count[lam],
+            }
             for k in range(1, self.max_k + 1):
                 values = results[lam][k]
                 if len(values) == 0:
@@ -170,9 +172,12 @@ class OccupancyChecker:
                 row[f"std_occupancy@{k}"] = std_v
             summary_rows.append(row)
 
-        summary_fieldnames = ["lambda", "num_samples_used", "num_samples_skipped"] + \
-            [f"mean_occupancy@{k}" for k in range(1, self.max_k + 1)] + \
-            [f"std_occupancy@{k}" for k in range(1, self.max_k + 1)]
+        summary_fieldnames = ["lambda", "num_samples_used", "num_samples_skipped"]
+        for k in range(1, self.max_k + 1):
+            summary_fieldnames.append(f"mean_occupancy@{k}")
+        for k in range(1, self.max_k + 1):
+            summary_fieldnames.append(f"std_occupancy@{k}")
+
         with open(summary_csv_path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=summary_fieldnames)
             writer.writeheader()

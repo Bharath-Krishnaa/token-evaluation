@@ -1,17 +1,5 @@
-"""
-Computes the final training losses (KL, sparsity, total) for the frozen
-mask, used by pruning_eval.py.
-
-Reuses the same base_embeddings/final_mask_hard that pruning_core.train_mask
-already produced -- one extra forward pass with the frozen mask, same KL +
-sparsity formula train_mask uses during training, just evaluated once at the
-end instead of every training step.
-
-This file owns result.csv / result_summary.csv (whatever paths
---total_loss_per_sample_csv / --total_loss_summary_csv point at). Existing
-rows are read on startup, so a run picks up where it left off, same as the
-other checkers.
-"""
+# Final KL, sparsity and total loss with the final mask.
+# Same loss as in train_mask computed once at the end.
 
 import csv
 import os
@@ -22,7 +10,7 @@ import torch.nn.functional as F
 
 
 def compute_final_losses(model, base_embeddings, final_mask_hard, think_start, think_end,
-                          pred_positions, normal_probs, lambda_sparsity):
+                         pred_positions, normal_probs, lambda_sparsity):
     with torch.no_grad():
         embeddings = base_embeddings.clone()
         embeddings[:, think_start:think_end, :] = (
@@ -39,13 +27,22 @@ def compute_final_losses(model, base_embeddings, final_mask_hard, think_start, t
     return kl_loss, sparsity_loss, total_loss
 
 
+def mean_std(values):
+    if len(values) == 0:
+        return float("nan"), float("nan")
+    if len(values) == 1:
+        return values[0], 0.0
+    return statistics.mean(values), statistics.stdev(values)
+
+
 class TotalLossChecker:
     def __init__(self, per_sample_csv):
         self.per_sample_csv = per_sample_csv
-        self.completed_pairs = self._load_completed_pairs()
+
+        # rows already in the CSV are not run again
+        self.completed_pairs = self.load_completed_pairs()
         if self.completed_pairs:
-            print(f"found {len(self.completed_pairs)} already-completed (sample_idx, lambda) row(s) "
-                  f"in {per_sample_csv}, skipping those")
+            print(f"total loss: {len(self.completed_pairs)} rows already in {per_sample_csv}, skipping them")
 
         file_is_new = not os.path.exists(per_sample_csv)
         self.fieldnames = [
@@ -53,13 +50,13 @@ class TotalLossChecker:
             "seq_len", "kept_tokens", "dropped_tokens", "kept_fraction",
             "final_kl_loss", "final_sparsity_loss", "final_total_loss", "lambda_sparsity",
         ]
-        self._file = open(per_sample_csv, "a", newline="")
-        self._writer = csv.DictWriter(self._file, fieldnames=self.fieldnames)
+        self.csv_file = open(per_sample_csv, "a", newline="")
+        self.writer = csv.DictWriter(self.csv_file, fieldnames=self.fieldnames)
         if file_is_new:
-            self._writer.writeheader()
-            self._file.flush()
+            self.writer.writeheader()
+            self.csv_file.flush()
 
-    def _load_completed_pairs(self):
+    def load_completed_pairs(self):
         completed = set()
         if not os.path.exists(self.per_sample_csv):
             return completed
@@ -75,10 +72,10 @@ class TotalLossChecker:
     def is_done(self, sample_idx, lam):
         return (sample_idx, lam) in self.completed_pairs
 
-    def _write_row(self, row):
-        self._writer.writerow(row)
-        self._file.flush()
-        os.fsync(self._file.fileno())  # write to disk right away
+    def write_row(self, row):
+        self.writer.writerow(row)
+        self.csv_file.flush()
+        os.fsync(self.csv_file.fileno())  # save to disk right away
         self.completed_pairs.add((row["sample_idx"], row["lambda_sparsity"]))
 
     def record_skip(self, sample_idx, lam, num_think_tokens, skip_reason):
@@ -99,11 +96,11 @@ class TotalLossChecker:
             "final_total_loss": "",
             "lambda_sparsity": lam,
         }
-        self._write_row(row)
+        self.write_row(row)
 
     def record_result(self, model, base_embeddings, final_mask_hard, think_start, think_end,
-                       pred_positions, normal_probs, sample_idx, lam, num_think_tokens,
-                       num_answer_tokens, kept):
+                      pred_positions, normal_probs, sample_idx, lam, num_think_tokens,
+                      num_answer_tokens, kept):
         if (sample_idx, lam) in self.completed_pairs:
             return None
 
@@ -113,7 +110,10 @@ class TotalLossChecker:
         )
 
         dropped = num_think_tokens - kept
-        kept_fraction = kept / num_think_tokens if num_think_tokens else 0.0
+        if num_think_tokens:
+            kept_fraction = kept / num_think_tokens
+        else:
+            kept_fraction = 0.0
 
         row = {
             "sample_idx": sample_idx,
@@ -130,15 +130,14 @@ class TotalLossChecker:
             "final_total_loss": total_loss,
             "lambda_sparsity": lam,
         }
-        self._write_row(row)
+        self.write_row(row)
         return {"kl_loss": kl_loss, "sparsity_loss": sparsity_loss, "total_loss": total_loss}
 
     def close(self):
-        self._file.close()
+        self.csv_file.close()
 
     def write_summary(self, summary_csv_path):
-        # rebuilds summary_csv_path from scratch using whatever is currently
-        # in per_sample_csv, same as the other checkers
+        # final summary is made from all rows in the per sample CSV
         results = {}
         skipped_count = {}
 
@@ -149,9 +148,12 @@ class TotalLossChecker:
                     lam = float(row["lambda_sparsity"])
                 except (KeyError, ValueError, TypeError):
                     continue
-                results.setdefault(lam, {"kept_fraction": [], "kl": [], "sparsity": [], "total": []})
-                skipped_count.setdefault(lam, 0)
 
+                if lam not in results:
+                    results[lam] = {"kept_fraction": [], "kl": [], "sparsity": [], "total": []}
+                    skipped_count[lam] = 0
+
+                # status is filled only for skipped samples
                 if row.get("status"):
                     skipped_count[lam] += 1
                     continue
@@ -164,13 +166,6 @@ class TotalLossChecker:
                     results[lam]["sparsity"].append(float(row["final_sparsity_loss"]))
                 if row.get("final_total_loss", "") not in ("", None):
                     results[lam]["total"].append(float(row["final_total_loss"]))
-
-        def mean_std(values):
-            if len(values) == 0:
-                return float("nan"), float("nan")
-            if len(values) == 1:
-                return values[0], 0.0
-            return statistics.mean(values), statistics.stdev(values)
 
         summary_rows = []
         for lam in sorted(results.keys()):

@@ -1,8 +1,4 @@
-"""
-Checks whether masking changes the model's FINAL ANSWER, not just its
-next-token distributions.
-
-"""
+# Checks if the final answer stays the same after masking the thinking tokens.
 
 import csv
 import os
@@ -13,22 +9,18 @@ import torch
 
 
 def extract_final_number(text):
-    # pulls out the last number in text, e.g. "...answer is 42." -> 42.0
-    # strips commas first so "1,024" parses as 1024
+    # last number in the text, e.g. "the answer is 1,024." -> 1024.0 is taken
     if not text:
         return None
     cleaned = text.replace(",", "")
     matches = re.findall(r"-?\d+\.?\d*", cleaned)
     if not matches:
         return None
-    try:
-        return float(matches[-1])
-    except ValueError:
-        return None
+    return float(matches[-1])
 
 
 def numbers_match(a, b, tol=1e-4):
-    # None means "no answer extracted" -- never counts as matching
+    # no number found means no match
     if a is None or b is None:
         return False
     return abs(a - b) <= tol
@@ -41,22 +33,22 @@ class AccuracyChecker:
         self.answer_max_new_tokens = answer_max_new_tokens
         self.per_sample_csv = per_sample_csv
 
-        self.completed_pairs = self._load_completed_pairs()
+        # rows already in the CSV are not run again
+        self.completed_pairs = self.load_completed_pairs()
         if self.completed_pairs:
-            print(f"[accuracy_checker] found {len(self.completed_pairs)} already-completed "
-                  f"(sample_idx, lambda) row(s) in {per_sample_csv}, skipping those")
+            print(f"accuracy: {len(self.completed_pairs)} rows already in {per_sample_csv}, skipping them")
 
         file_is_new = not os.path.exists(per_sample_csv)
         self.fieldnames = ["sample_idx", "lambda", "num_think_tokens", "kept_tokens",
-                            "dropped_tokens", "skip_reason", "baseline_pred", "masked_pred",
-                            "consistent_with_baseline"]
+                           "dropped_tokens", "skip_reason", "baseline_pred", "masked_pred",
+                           "consistent_with_baseline"]
         self.csv_file = open(per_sample_csv, "a", newline="")
         self.writer = csv.DictWriter(self.csv_file, fieldnames=self.fieldnames)
         if file_is_new:
             self.writer.writeheader()
             self.csv_file.flush()
 
-    def _load_completed_pairs(self):
+    def load_completed_pairs(self):
         completed = set()
         if not os.path.exists(self.per_sample_csv):
             return completed
@@ -72,16 +64,16 @@ class AccuracyChecker:
     def is_done(self, sample_idx, lam):
         return (sample_idx, lam) in self.completed_pairs
 
-    def _write_row(self, row):
+    def write_row(self, row):
         self.writer.writerow(row)
         self.csv_file.flush()
-        os.fsync(self.csv_file.fileno())  # write to disk right away
+        os.fsync(self.csv_file.fileno())  # saves to disk 
         self.completed_pairs.add((row["sample_idx"], row["lambda"]))
 
     def record_skip(self, sample_idx, lam, num_think_tokens, skip_reason):
         if (sample_idx, lam) in self.completed_pairs:
             return
-        self._write_row({
+        self.write_row({
             "sample_idx": sample_idx,
             "lambda": lam,
             "num_think_tokens": num_think_tokens,
@@ -94,41 +86,39 @@ class AccuracyChecker:
         })
 
     def record_result(self, model, base_embeddings, final_mask_hard, think_start, think_end,
-                       sample_idx, lam, num_think_tokens, kept, baseline_answer_text):
-        # baseline_answer_text is the UNMASKED model's own generated answer
-        # (the answer_text already computed in the main script) -- the
-        # reference point here, not GSM8K's ground truth.
-        # Reuses the same base_embeddings/final_mask_hard already computed,
-        # so this only adds one extra generate() call.
+                      sample_idx, lam, num_think_tokens, kept, baseline_answer_text):
+        # baseline is the normal model's own answer in essence the unmasked model's own answer and not the GSM8K label
         if (sample_idx, lam) in self.completed_pairs:
             return None
 
         baseline_pred = extract_final_number(baseline_answer_text)
-        masked_generated_text = self._generate_masked_answer(
+        masked_text = self.generate_masked_answer(
             model, base_embeddings, final_mask_hard, think_start, think_end
         )
-        masked_pred = extract_final_number(masked_generated_text)
+        masked_pred = extract_final_number(masked_text)
         consistent = numbers_match(masked_pred, baseline_pred)
 
-        self._write_row({
+        if baseline_pred is None:
+            baseline_pred = ""
+        if masked_pred is None:
+            masked_pred = ""
+
+        self.write_row({
             "sample_idx": sample_idx,
             "lambda": lam,
             "num_think_tokens": num_think_tokens,
             "kept_tokens": kept,
             "dropped_tokens": num_think_tokens - kept,
             "skip_reason": "",
-            "baseline_pred": "" if baseline_pred is None else baseline_pred,
-            "masked_pred": "" if masked_pred is None else masked_pred,
+            "baseline_pred": baseline_pred,
+            "masked_pred": masked_pred,
             "consistent_with_baseline": int(consistent),
         })
         return consistent
 
-    def _generate_masked_answer(self, model, base_embeddings, final_mask_hard,
-                                 think_start, think_end):
-        # free generation under the frozen mask, no teacher forcing. When
-        # generate() is called with inputs_embeds instead of input_ids, the
-        # returned tensor is ONLY the newly generated tokens, so there's no
-        # prompt-length slicing needed here.
+    def generate_masked_answer(self, model, base_embeddings, final_mask_hard,
+                               think_start, think_end):
+        # apply the mask and then let the model generate the answer after </think>
         embeddings = base_embeddings.clone()
         embeddings[:, think_start:think_end, :] = (
             base_embeddings[:, think_start:think_end, :] * final_mask_hard.unsqueeze(-1)
@@ -145,14 +135,14 @@ class AccuracyChecker:
                 pad_token_id=self.tokenizer.eos_token_id,
             )
 
+        # with inputs_embeds generate() returns only the new tokens
         return self.tokenizer.decode(generated_ids[0], skip_special_tokens=True).strip()
 
     def close(self):
         self.csv_file.close()
 
     def write_summary(self, summary_csv_path):
-        # rebuilds summary_csv_path from scratch using whatever is currently
-        # in per_sample_csv, so it reflects the full accumulated dataset
+        # final summary is made from all rows in the per sample CSV
         consistent_vals = {}
         skipped_count = {}
         used_count = {}
@@ -164,9 +154,11 @@ class AccuracyChecker:
                     lam = float(row["lambda"])
                 except (KeyError, ValueError, TypeError):
                     continue
-                consistent_vals.setdefault(lam, [])
-                skipped_count.setdefault(lam, 0)
-                used_count.setdefault(lam, 0)
+
+                if lam not in consistent_vals:
+                    consistent_vals[lam] = []
+                    skipped_count[lam] = 0
+                    used_count[lam] = 0
 
                 if row.get("skip_reason"):
                     skipped_count[lam] += 1
@@ -179,14 +171,16 @@ class AccuracyChecker:
 
         summary_rows = []
         for lam in sorted(consistent_vals.keys()):
+            # fraction of samples where the masked answer matches the normal answer
+            if consistent_vals[lam]:
+                accuracy = statistics.mean(consistent_vals[lam])
+            else:
+                accuracy = float("nan")
             summary_rows.append({
                 "lambda": lam,
                 "num_samples_used": used_count[lam],
                 "num_samples_skipped": skipped_count[lam],
-                # fraction of used samples where the freely regenerated
-                # masked answer matched the unmasked model's original answer
-                "accuracy": (statistics.mean(consistent_vals[lam])
-                             if consistent_vals[lam] else float("nan")),
+                "accuracy": accuracy,
             })
 
         with open(summary_csv_path, "w", newline="") as f:

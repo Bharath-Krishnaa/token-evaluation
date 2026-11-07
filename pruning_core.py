@@ -1,10 +1,5 @@
-"""
-Core pruning logic for one GSM8K sample: load the model, generate the
-sample's reasoning + answer, build the input sequence, run the normal
-(unmasked) forward pass, and train the mask over the thinking tokens.
-
-pruning_eval.py imports from this file to run the whole pipeline.
-"""
+# Model loading, generation and mask training for one GSM8K sample.
+# The <think> and </think> tokens are always kept as mask = 1
 
 import torch
 import torch.nn.functional as F
@@ -14,14 +9,14 @@ MODEL_NAME = "Qwen/Qwen3-0.6B"
 
 
 def load_model_and_tokenizer(model_name=MODEL_NAME, device="cpu"):
-    # loads the frozen base model + tokenizer, freezes all params so only
-    # the mask (in train_mask) ever trains
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
     model.eval()
+
+    # freeze the model, only the mask is trained
     for param in model.parameters():
         param.requires_grad = False
 
@@ -34,7 +29,6 @@ def get_sample(data, idx):
 
 
 def generate_reasoning_and_answer(tokenizer, model, question, device, max_new_tokens, label=""):
-
     messages = [{"role": "user", "content": question}]
     prompt_ids = tokenizer.apply_chat_template(
         messages, add_generation_prompt=True, return_tensors="pt"
@@ -56,16 +50,17 @@ def generate_reasoning_and_answer(tokenizer, model, question, device, max_new_to
     truncated_by_cap = False
 
     if "<think>" in generated_text and "</think>" in generated_text:
+        # split into thinking part and answer part
         _, _, after_open = generated_text.partition("<think>")
         thinking_text, _, answer_text = after_open.partition("</think>")
     else:
-        # model didn't open a <think> block, or generation hit max_new_tokens
+        # no think tags, or generation stopped at max_new_tokens
         truncated_by_cap = len(new_tokens) >= max_new_tokens
-        reason = "generation hit --max_new_tokens (likely truncated mid-thought)" \
-            if truncated_by_cap else "no <think>/</think> tags found in generated text"
-        print(f"  [WARNING]{(' ' + label) if label else ''}: falling back to empty "
-              f"thinking_text ({reason}, generated {len(new_tokens)} tokens). "
-              f"This sample will be EXCLUDED from the occupancy stats.")
+        if truncated_by_cap:
+            reason = "hit max_new_tokens"
+        else:
+            reason = "no think tags found"
+        print(f"  warning {label}: {reason}, generated {len(new_tokens)} tokens, sample will be skipped")
         thinking_text = ""
         answer_text = generated_text
 
@@ -74,12 +69,13 @@ def generate_reasoning_and_answer(tokenizer, model, question, device, max_new_to
 
 def make_input(tokenizer, q_tokens, thinking_text, answer_text, device):
     think_tokens = tokenizer("<think>" + thinking_text + "</think>",
-                              return_tensors="pt", add_special_tokens=False).input_ids[0].to(device)
+                             return_tensors="pt", add_special_tokens=False).input_ids[0].to(device)
     ans_tokens = tokenizer(answer_text,
-                            return_tensors="pt", add_special_tokens=False).input_ids[0].to(device)
+                           return_tensors="pt", add_special_tokens=False).input_ids[0].to(device)
 
+    # question + thinking + answer
     all_tokens = torch.cat([q_tokens, think_tokens, ans_tokens])
-    input_ids = all_tokens.unsqueeze(0).to(device)
+    input_ids = all_tokens.unsqueeze(0)
 
     think_start = len(q_tokens)
     think_end = think_start + len(think_tokens)
@@ -88,9 +84,11 @@ def make_input(tokenizer, q_tokens, thinking_text, answer_text, device):
 
 
 def compute_base(model, input_ids, think_end, device):
-    # unmasked forward pass, done once per sample
+    # normal forward pass without mask, done once per sample
     embed_layer = model.get_input_embeddings()
     seq_len = input_ids.shape[1]
+
+    # positions that predict the answer tokens
     pred_positions = torch.arange(think_end - 1, seq_len - 1, device=device)
 
     with torch.no_grad():
@@ -101,10 +99,17 @@ def compute_base(model, input_ids, think_end, device):
     return base_embeddings, normal_probs, pred_positions
 
 
+def keep_think_tags(mask):
+    # first position is <think>, last is </think>
+    mask[:, 0] = 1
+    mask[:, -1] = 1
+    return mask
+
+
 def train_mask(model, base_embeddings, think_start, think_end, normal_probs, pred_positions,
-                device, lambda_sparsity, steps, lr, warmup_steps, init_score):
-    # trains a mask over the thinking tokens: which ones can be zeroed out
-    # while keeping the answer predictions close to the unmasked model's
+               device, lambda_sparsity, steps, lr, warmup_steps, init_score):
+    # learn which thinking tokens can be removed while the answer
+    # predictions stay close to the normal (unmasked) model
 
     batch_size = base_embeddings.shape[0]
     num_think_tokens = think_end - think_start
@@ -116,15 +121,19 @@ def train_mask(model, base_embeddings, think_start, think_end, normal_probs, pre
     optimizer = torch.optim.Adam([mask_param], lr=lr)
 
     for step in range(steps):
+        # lambda goes up slowly during warmup
         warmup_progress = min(1.0, step / max(1, warmup_steps))
         lam = lambda_sparsity * warmup_progress
 
         optimizer.zero_grad()
 
+        # hard 0/1 mask in forward pass, soft mask gradient in backward pass
         mask_soft = torch.sigmoid(mask_param)
         mask_hard = (mask_soft > 0.5).float()
-        mask = mask_hard + mask_soft - mask_soft.detach()  # straight-through estimator
+        mask = mask_hard + mask_soft - mask_soft.detach()
+        mask = keep_think_tags(mask)
 
+        # apply mask on thinking token embeddings
         embeddings = base_embeddings.clone()
         embeddings[:, think_start:think_end, :] = (
             base_embeddings[:, think_start:think_end, :] * mask.unsqueeze(-1)
@@ -133,6 +142,7 @@ def train_mask(model, base_embeddings, think_start, think_end, normal_probs, pre
         masked_logits = model(inputs_embeds=embeddings).logits
         masked_log_probs = F.log_softmax(masked_logits[:, pred_positions, :], dim=-1)
 
+        # KL between masked and normal predictions + sparsity
         kl_per_token = F.kl_div(masked_log_probs, normal_probs, reduction="none").sum(dim=-1)
         kl_loss = kl_per_token.mean()
         sparsity_loss = mask.mean()
@@ -144,5 +154,6 @@ def train_mask(model, base_embeddings, think_start, think_end, normal_probs, pre
     with torch.no_grad():
         final_mask_soft = torch.sigmoid(mask_param)
         final_mask_hard = (final_mask_soft > 0.5).float()
+        final_mask_hard = keep_think_tags(final_mask_hard)
 
     return final_mask_hard
