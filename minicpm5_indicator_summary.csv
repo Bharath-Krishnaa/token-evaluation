@@ -1,0 +1,2 @@
+lambda,num_samples_used,num_samples_skipped,total_tokens_collected,fraction_kept
+0.01,1828,173,1938863,0.6562361549010941
